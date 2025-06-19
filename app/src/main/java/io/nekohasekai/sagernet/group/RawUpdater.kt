@@ -1,7 +1,6 @@
 package io.nekohasekai.sagernet.group
 
 import android.annotation.SuppressLint
-import android.net.Uri
 import io.nekohasekai.sagernet.R
 import io.nekohasekai.sagernet.database.*
 import io.nekohasekai.sagernet.fmt.AbstractBean
@@ -22,7 +21,9 @@ import io.nekohasekai.sagernet.fmt.wireguard.WireGuardBean
 import io.nekohasekai.sagernet.ktx.*
 import libcore.Libcore
 import moe.matsuri.nb4a.Protocols
+import moe.matsuri.nb4a.proxy.anytls.AnyTLSBean
 import moe.matsuri.nb4a.proxy.config.ConfigBean
+import moe.matsuri.nb4a.utils.Util
 import org.ini4j.Ini
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,6 +32,7 @@ import org.yaml.snakeyaml.TypeDescription
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.error.YAMLException
 import java.io.StringReader
+import androidx.core.net.toUri
 
 @Suppress("EXPERIMENTAL_API_USAGE")
 object RawUpdater : GroupUpdater() {
@@ -46,7 +48,7 @@ object RawUpdater : GroupUpdater() {
         val link = subscription.link
         var proxies: List<AbstractBean>
         if (link.startsWith("content://")) {
-            val contentText = app.contentResolver.openInputStream(Uri.parse(link))
+            val contentText = app.contentResolver.openInputStream(link.toUri())
                 ?.bufferedReader()
                 ?.readText()
 
@@ -66,10 +68,11 @@ object RawUpdater : GroupUpdater() {
                 setURL(subscription.link)
                 setUserAgent(subscription.customUserAgent.takeIf { it.isNotBlank() } ?: USER_AGENT)
             }.execute()
-            proxies = parseRaw(response.contentString)
+            proxies = parseRaw(Util.getStringBox(response.contentString))
                 ?: error(app.getString(R.string.no_proxies_found))
 
-            subscription.subscriptionUserinfo = response.getHeader("Subscription-Userinfo")
+            subscription.subscriptionUserinfo =
+                Util.getStringBox(response.getHeader("Subscription-Userinfo"))
         }
 
         val proxiesMap = LinkedHashMap<String, AbstractBean>()
@@ -171,11 +174,12 @@ object RawUpdater : GroupUpdater() {
                 }
             } else {
                 changed++
-                SagerDatabase.proxyDao.addProxy(ProxyEntity(
-                    groupId = proxyGroup.id, userOrder = userOrder
-                ).apply {
-                    putBean(bean)
-                })
+                SagerDatabase.proxyDao.addProxy(
+                    ProxyEntity(
+                        groupId = proxyGroup.id, userOrder = userOrder
+                    ).apply {
+                        putBean(bean)
+                    })
                 added.add(name)
                 Logs.d("Inserted profile: $name")
             }
@@ -247,6 +251,7 @@ object RawUpdater : GroupUpdater() {
                                 setTLS(proxy["tls"]?.toString() == "true")
                                 sni = proxy["sni"]?.toString()
                                 name = proxy["name"]?.toString()
+                                allowInsecure = proxy["skip-cert-verify"]?.toString() == "true"
                             })
                         }
 
@@ -285,147 +290,186 @@ object RawUpdater : GroupUpdater() {
                             })
                         }
 
-                        "vmess", "vless" -> {
-                            var isHttpUpgrade = false
-                            val isVLESS = proxy["type"].toString() == "vless"
-                            val bean = VMessBean().apply {
-                                if (isVLESS) {
+                        "vmess", "vless", "trojan" -> {
+                            val bean = when (proxy["type"] as String) {
+                                "vmess" -> VMessBean()
+                                "vless" -> VMessBean().apply {
                                     alterId = -1 // make it VLESS
                                     packetEncoding = 2 // clash meta default XUDP
                                 }
+
+                                "trojan" -> TrojanBean().apply {
+                                    security = "tls"
+                                }
+
+                                else -> error("impossible")
                             }
+
+                            bean.serverAddress = proxy["server"]?.toString() ?: continue
+                            bean.serverPort = proxy["port"]?.toString()?.toIntOrNull() ?: continue
+
                             for (opt in proxy) {
-                                if (opt.value == null) continue
-                                when (opt.key.replace("_", "-")) {
-                                    "name" -> bean.name = opt.value.toString()
-                                    "server" -> bean.serverAddress = opt.value as String
-                                    "port" -> bean.serverPort = opt.value.toString().toInt()
-                                    "uuid" -> bean.uuid = opt.value as String
+                                when (opt.key) {
+                                    "name" -> bean.name = opt.value?.toString()
+                                    "password" -> if (bean is TrojanBean) bean.password =
+                                        opt.value?.toString()
 
-                                    "alterId" -> if (!isVLESS) bean.alterId =
-                                        opt.value.toString().toInt()
+                                    "uuid" -> if (bean is VMessBean) bean.uuid =
+                                        opt.value?.toString()
 
-                                    "cipher" -> if (!isVLESS) bean.encryption = opt.value as String
+                                    "alterId" -> if (bean is VMessBean && !bean.isVLESS) bean.alterId =
+                                        opt.value?.toString()?.toIntOrNull()
 
-                                    "flow" -> if (isVLESS) bean.encryption = opt.value as String
+                                    "cipher" -> if (bean is VMessBean && !bean.isVLESS) bean.encryption =
+                                        (opt.value as? String)
 
-                                    "packet-addr" -> if (opt.value.toString() == "true") {
-                                        bean.packetEncoding = 1
-                                    }
-
-                                    "xudp" -> if (opt.value.toString() == "true") {
-                                        bean.packetEncoding = 2
-                                    }
-
-                                    "network" -> {
-                                        bean.type = opt.value as String
-                                        // Clash "network" fix
-                                        when (bean.type) {
-                                            "h2" -> bean.type = "http"
+                                    "flow" -> if (bean is VMessBean && bean.isVLESS) {
+                                        (opt.value as? String)?.let {
+                                            if (it.contains("xtls-rprx-vision")) {
+                                                bean.encryption = "xtls-rprx-vision"
+                                            }
                                         }
                                     }
+
+                                    "packet-encoding" -> if (bean is VMessBean) {
+                                        bean.packetEncoding = when ((opt.value as? String)) {
+                                            "packetaddr" -> 1
+                                            "xudp" -> 2
+                                            else -> 0
+                                        }
+                                    }
+
+                                    "tls" -> if (bean is VMessBean) {
+                                        bean.security =
+                                            if (opt.value as? Boolean == true) "tls" else ""
+                                    }
+
+                                    "servername", "sni" -> bean.sni = opt.value?.toString()
+
+                                    "alpn" -> bean.alpn =
+                                        (opt.value as? List<Any>)?.joinToString("\n")
+
+                                    "skip-cert-verify" -> bean.allowInsecure =
+                                        opt.value as? Boolean == true
 
                                     "client-fingerprint" -> bean.utlsFingerprint =
                                         opt.value as String
 
-                                    "tls" -> bean.security =
-                                        if (opt.value.toString() == "true") "tls" else ""
+                                    "reality-opts" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (realityOpt in it) {
+                                            bean.security = "tls"
 
-                                    "servername" -> bean.sni = opt.value.toString()
+                                            when (realityOpt.key) {
+                                                "public-key" -> bean.realityPubKey =
+                                                    realityOpt.value?.toString()
 
-                                    "skip-cert-verify" -> bean.allowInsecure =
-                                        opt.value.toString() == "true"
-
-                                    "alpn" -> {
-                                        val alpn = (opt.value as? (List<String>))
-                                        bean.alpn = alpn?.joinToString("\n")
-                                    }
-
-                                    "ws-path" -> bean.path = opt.value.toString()
-                                    "ws-headers" -> for (wsHeader in (opt.value as Map<String, Any>)) {
-                                        when (wsHeader.key.lowercase()) {
-                                            "host" -> bean.host = wsHeader.value.toString()
+                                                "short-id" -> bean.realityShortId =
+                                                    realityOpt.value?.toString()
+                                            }
                                         }
                                     }
 
-                                    "ws-opts", "ws-opt" -> for (wsOpt in (opt.value as Map<String, Any>)) {
-                                        when (wsOpt.key.lowercase()) {
-                                            "headers" -> for (wsHeader in (wsOpt.value as Map<String, Any>)) {
-                                                when (wsHeader.key.lowercase()) {
-                                                    "host" -> bean.host = wsHeader.value.toString()
+                                    "network" -> {
+                                        when (opt.value) {
+                                            "h2", "http" -> bean.type = "http"
+                                            "ws", "grpc" -> bean.type = opt.value as String
+                                        }
+                                    }
+
+                                    "ws-opts" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (wsOpt in it) {
+                                            when (wsOpt.key) {
+                                                "headers" -> (wsOpt.value as? Map<Any, Any?>)?.forEach { (key, value) ->
+                                                    when (key.toString().lowercase()) {
+                                                        "host" -> {
+                                                            bean.host = value?.toString()
+                                                        }
+                                                    }
                                                 }
-                                            }
 
-                                            "path" -> {
-                                                bean.path = wsOpt.value.toString()
-                                            }
+                                                "path" -> {
+                                                    bean.path = wsOpt.value?.toString()
+                                                }
 
-                                            "max-early-data" -> {
-                                                bean.wsMaxEarlyData = wsOpt.value.toString().toInt()
-                                            }
+                                                "max-early-data" -> {
+                                                    bean.wsMaxEarlyData =
+                                                        wsOpt.value?.toString()?.toIntOrNull()
+                                                }
 
-                                            "early-data-header-name" -> {
-                                                bean.earlyDataHeaderName = wsOpt.value.toString()
-                                            }
+                                                "early-data-header-name" -> {
+                                                    bean.earlyDataHeaderName =
+                                                        wsOpt.value?.toString()
+                                                }
 
-                                            "v2ray-http-upgrade" -> {
-                                                isHttpUpgrade = true
-                                            }
-                                        }
-                                    }
-
-                                    // The format of the VMessBean is wrong, so the `host` `path` has some strange transformations here.
-                                    "h2-opts", "h2-opt" -> for (h2Opt in (opt.value as Map<String, Any>)) {
-                                        when (h2Opt.key.lowercase()) {
-                                            "host" -> bean.host =
-                                                (h2Opt.value as List<String>).first()
-
-                                            "path" -> bean.path = h2Opt.value.toString()
-                                        }
-                                    }
-
-                                    "http-opts", "http-opt" -> for (httpOpt in (opt.value as Map<String, Any>)) {
-                                        when (httpOpt.key.lowercase()) {
-                                            "path" -> bean.path =
-                                                (httpOpt.value as List<String>).first()
-
-                                            "headers" -> for (hdr in (httpOpt.value as Map<String, Any>)) {
-                                                when (hdr.key.lowercase()) {
-                                                    "host" -> bean.host =
-                                                        (hdr.value as List<String>).first()
+                                                "v2ray-http-upgrade" -> {
+                                                    if (wsOpt.value as? Boolean == true) {
+                                                        bean.type = "httpupgrade"
+                                                    }
                                                 }
                                             }
                                         }
                                     }
 
-                                    "grpc-opts", "grpc-opt" -> for (grpcOpt in (opt.value as Map<String, Any>)) {
-                                        when (grpcOpt.key.lowercase()) {
-                                            "grpc-service-name" -> bean.path =
-                                                grpcOpt.value.toString()
+                                    "h2-opts" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (h2Opt in it) {
+                                            when (h2Opt.key) {
+                                                "host" -> bean.host =
+                                                    (h2Opt.value as? List<Any>)?.joinToString("\n")
+
+                                                "path" -> bean.path = h2Opt.value?.toString()
+                                            }
                                         }
                                     }
 
-                                    "reality-opts" -> for (realityOpt in (opt.value as Map<String, Any>)) {
-                                        when (realityOpt.key.lowercase()) {
-                                            "public-key" -> bean.realityPubKey =
-                                                realityOpt.value.toString()
+                                    "http-opts" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (httpOpt in it) {
+                                            when (httpOpt.key) {
+                                                "path" -> bean.path =
+                                                    (httpOpt.value as? List<Any>)?.joinToString("\n")
 
-                                            "short-id" -> bean.realityShortId =
-                                                realityOpt.value.toString()
+                                                "headers" -> {
+                                                    (httpOpt.value as? Map<Any, List<Any>>)?.forEach { (key, value) ->
+                                                        when (key.toString().lowercase()) {
+                                                            "host" -> {
+                                                                bean.host = value.joinToString("\n")
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    "grpc-opts" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (grpcOpt in it) {
+                                            when (grpcOpt.key) {
+                                                "grpc-service-name" -> bean.path =
+                                                    grpcOpt.value?.toString()
+                                            }
+                                        }
+                                    }
+
+                                    "smux" -> (opt.value as? Map<String, Any?>)?.also {
+                                        for (smuxOpt in it) {
+                                            when (smuxOpt.key) {
+                                                "enabled" -> bean.enableMux =
+                                                    smuxOpt.value.toString() == "true"
+
+                                                "max-streams" -> bean.muxConcurrency =
+                                                    smuxOpt.value.toString().toInt()
+
+                                                "padding" -> bean.muxPadding =
+                                                    smuxOpt.value.toString() == "true"
+                                            }
                                         }
                                     }
                                 }
                             }
-                            if (isHttpUpgrade) {
-                                bean.type = "httpupgrade"
-                            }
                             proxies.add(bean)
                         }
 
-                        "trojan" -> {
-                            var isHttpUpgrade = false
-                            val bean = TrojanBean()
-                            bean.security = "tls"
+                        "anytls" -> {
+                            val bean = AnyTLSBean()
                             for (opt in proxy) {
                                 if (opt.value == null) continue
                                 when (opt.key.replace("_", "-")) {
@@ -444,39 +488,7 @@ object RawUpdater : GroupUpdater() {
                                         val alpn = (opt.value as? (List<String>))
                                         bean.alpn = alpn?.joinToString("\n")
                                     }
-
-                                    "network" -> when (opt.value) {
-                                        "ws", "grpc" -> bean.type = opt.value.toString()
-                                    }
-
-                                    "ws-opts", "ws-opt" -> for (wsOpt in (opt.value as Map<String, Any>)) {
-                                        when (wsOpt.key.lowercase()) {
-                                            "headers" -> for (wsHeader in (wsOpt.value as Map<String, Any>)) {
-                                                when (wsHeader.key.lowercase()) {
-                                                    "host" -> bean.host = wsHeader.value.toString()
-                                                }
-                                            }
-
-                                            "path" -> {
-                                                bean.path = wsOpt.value.toString()
-                                            }
-
-                                            "v2ray-http-upgrade" -> {
-                                                isHttpUpgrade = true
-                                            }
-                                        }
-                                    }
-
-                                    "grpc-opts", "grpc-opt" -> for (grpcOpt in (opt.value as Map<String, Any>)) {
-                                        when (grpcOpt.key.lowercase()) {
-                                            "grpc-service-name" -> bean.path =
-                                                grpcOpt.value.toString()
-                                        }
-                                    }
                                 }
-                            }
-                            if (isHttpUpgrade) {
-                                bean.type = "httpupgrade"
                             }
                             proxies.add(bean)
                         }
@@ -731,9 +743,25 @@ object RawUpdater : GroupUpdater() {
                 }
 
                 json.has("outbounds") -> {
-                    return listOf(ConfigBean().applyDefaultValues().apply {
-                        config = json.toStringPretty()
-                    })
+                    return json.getJSONArray("outbounds")
+                        .filterIsInstance<JSONObject>()
+                        .mapNotNull {
+                            val ty = it.getStr("type")
+                            if (ty == null || ty == "" ||
+                                ty == "dns" || ty == "block" || ty == "direct" || ty == "selector" || ty == "urltest"
+                            ) {
+                                null
+                            } else {
+                                it
+                            }
+                        }.map {
+                            ConfigBean().apply {
+                                applyDefaultValues()
+                                type = 1
+                                config = it.toStringPretty()
+                                name = it.getStr("tag")
+                            }
+                        }
                 }
 
                 json.has("server") && json.has("server_port") -> {

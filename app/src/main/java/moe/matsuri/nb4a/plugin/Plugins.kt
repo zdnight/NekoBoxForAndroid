@@ -14,20 +14,18 @@ import io.nekohasekai.sagernet.utils.PackageCache
 object Plugins {
     const val AUTHORITIES_PREFIX_SEKAI_EXE = "io.nekohasekai.sagernet.plugin."
     const val AUTHORITIES_PREFIX_NEKO_EXE = "moe.matsuri.exe."
-    const val AUTHORITIES_PREFIX_NEKO_PLUGIN = "moe.matsuri.plugin."
 
     const val ACTION_NATIVE_PLUGIN = "io.nekohasekai.sagernet.plugin.ACTION_NATIVE_PLUGIN"
 
     const val METADATA_KEY_ID = "io.nekohasekai.sagernet.plugin.id"
     const val METADATA_KEY_EXECUTABLE_PATH = "io.nekohasekai.sagernet.plugin.executable_path"
 
-    fun isExeOrPlugin(pkg: PackageInfo): Boolean {
-        if (pkg.providers == null || pkg.providers.isEmpty()) return false
-        val provider = pkg.providers[0] ?: return false
+    fun isExe(pkg: PackageInfo): Boolean {
+        if (pkg.providers?.isEmpty() == true) return false
+        val provider = pkg.providers?.get(0) ?: return false
         val auth = provider.authority ?: return false
         return auth.startsWith(AUTHORITIES_PREFIX_SEKAI_EXE)
                 || auth.startsWith(AUTHORITIES_PREFIX_NEKO_EXE)
-                || auth.startsWith(AUTHORITIES_PREFIX_NEKO_PLUGIN)
     }
 
     fun preferExePrefix(): String {
@@ -92,8 +90,8 @@ object Plugins {
         PackageCache.awaitLoadSync()
         val pkgs = PackageCache.installedPluginPackages
             .map { it.value }
-            .filter { it.providers[0].loadString(METADATA_KEY_ID) == pluginId }
-        return pkgs.map { it.providers[0] }
+            .filter { it.providers?.get(0)?.loadString(METADATA_KEY_ID) == pluginId }
+        return pkgs.mapNotNull { it.providers?.get(0) }
     }
 
     private fun buildUri(id: String, auth: String) = Uri.Builder()

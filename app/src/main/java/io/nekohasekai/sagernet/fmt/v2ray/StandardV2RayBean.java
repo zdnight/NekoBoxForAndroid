@@ -52,11 +52,15 @@ public abstract class StandardV2RayBean extends AbstractBean {
 
     public Boolean enableECH;
 
-    public Boolean enablePqSignature;
-
-    public Boolean disabledDRS;
-
     public String echConfig;
+
+    // --------------------------------------- Mux
+
+    public Boolean enableMux;
+    public Boolean muxPadding;
+    public Integer muxType;
+    public Integer muxConcurrency;
+
 
     // --------------------------------------- //
 
@@ -77,7 +81,7 @@ public abstract class StandardV2RayBean extends AbstractBean {
         if (JavaUtil.isNullOrBlank(path)) path = "";
 
         if (JavaUtil.isNullOrBlank(security)) {
-            if (this instanceof TrojanBean || isVLESS()) {
+            if (this instanceof TrojanBean) {
                 security = "tls";
             } else {
                 security = "none";
@@ -99,13 +103,16 @@ public abstract class StandardV2RayBean extends AbstractBean {
 
         if (enableECH == null) enableECH = false;
         if (JavaUtil.isNullOrBlank(echConfig)) echConfig = "";
-        if (enablePqSignature == null) enablePqSignature = false;
-        if (disabledDRS == null) disabledDRS = false;
+
+        if (enableMux == null) enableMux = false;
+        if (muxPadding == null) muxPadding = false;
+        if (muxType == null) muxType = 0;
+        if (muxConcurrency == null) muxConcurrency = 1;
     }
 
     @Override
     public void serialize(ByteBufferOutput output) {
-        output.writeInt(1);
+        output.writeInt(3);
         super.serialize(output);
         output.writeString(uuid);
         output.writeString(encryption);
@@ -153,13 +160,14 @@ public abstract class StandardV2RayBean extends AbstractBean {
         }
 
         output.writeBoolean(enableECH);
-        if (enableECH) {
-            output.writeBoolean(enablePqSignature);
-            output.writeBoolean(disabledDRS);
-            output.writeString(echConfig);
-        }
+        output.writeString(echConfig);
 
         output.writeInt(packetEncoding);
+
+        output.writeBoolean(enableMux);
+        output.writeBoolean(muxPadding);
+        output.writeInt(muxType);
+        output.writeInt(muxConcurrency);
     }
 
     @Override
@@ -210,16 +218,18 @@ public abstract class StandardV2RayBean extends AbstractBean {
             realityShortId = input.readString();
         }
 
-        if (version >= 1) { // 从老版本升级上来
+        if (version >= 1) {
             enableECH = input.readBoolean();
-            if (enableECH) {
-                enablePqSignature = input.readBoolean();
-                disabledDRS = input.readBoolean();
+            if (version >= 3) {
                 echConfig = input.readString();
+            } else {
+                if (enableECH) {
+                    input.readBoolean();
+                    input.readBoolean();
+                    echConfig = input.readString();
+                }
             }
-        }
-
-        if (version == 0) {
+        } else if (version == 0) {
             // 从老版本升级上来但是 version == 0, 可能有 enableECH 也可能没有，需要做判断
             int position = input.getByteBuffer().position(); // 当前位置
 
@@ -231,14 +241,21 @@ public abstract class StandardV2RayBean extends AbstractBean {
             if (tmpPacketEncoding != 1 && tmpPacketEncoding != 2) {
                 enableECH = tmpEnableECH;
                 if (enableECH) {
-                    enablePqSignature = input.readBoolean();
-                    disabledDRS = input.readBoolean();
+                    input.readBoolean();
+                    input.readBoolean();
                     echConfig = input.readString();
                 }
             } // 否则后一位就是 packetEncoding
         }
 
         packetEncoding = input.readInt();
+
+        if (version >= 2) {
+            enableMux = input.readBoolean();
+            muxPadding = input.readBoolean();
+            muxType = input.readInt();
+            muxConcurrency = input.readInt();
+        }
     }
 
     @Override
@@ -249,8 +266,11 @@ public abstract class StandardV2RayBean extends AbstractBean {
         bean.utlsFingerprint = utlsFingerprint;
         bean.packetEncoding = packetEncoding;
         bean.enableECH = enableECH;
-        bean.disabledDRS = disabledDRS;
         bean.echConfig = echConfig;
+        bean.enableMux = enableMux;
+        bean.muxPadding = muxPadding;
+        bean.muxType = muxType;
+        bean.muxConcurrency = muxConcurrency;
     }
 
     public boolean isVLESS() {
